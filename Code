@@ -1,0 +1,277 @@
+"""
+Marketing Channel ROI Analysis (Python-only)
+==========================================
+
+What this script does:
+- Loads website sessions, orders, and refunds from CSVs
+- Derives a marketing "channel" from utm_source / utm_campaign / http_referer
+- Attributes orders to the session that created them (orders.website_session_id)
+- Rolls up item-level refunds to order-level, then attributes refunds to channels
+- Computes monthly + overall channel ROI metrics
+- Exports CSVs and saves simple bar charts
+
+How to run:
+1) Put CSVs here:
+   ./data/raw/website_sessions.csv
+   ./data/raw/orders.csv
+   ./data/raw/order_item_refunds.csv
+
+2) Install:
+   pip install pandas matplotlib
+
+3) Run:
+   python run_analysis.py
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+import pandas as pd
+import matplotlib.pyplot as plt
+
+
+# -----------------------------
+# Config
+# -----------------------------
+PROJECT_ROOT = Path(__file__).resolve().parent
+RAW_DIR = PROJECT_ROOT / "data" / "raw"
+OUT_DIR = PROJECT_ROOT / "outputs"
+
+
+# -----------------------------
+# Helpers
+# -----------------------------
+def _to_datetime(df: pd.DataFrame, col: str) -> pd.Series:
+    """Parse datetimes robustly (invalid parses become NaT)."""
+    return pd.to_datetime(df[col], errors="coerce", utc=False)
+
+
+def derive_channel(df_sessions: pd.DataFrame) -> pd.Series:
+    """
+    Derive a portfolio-friendly marketing channel label.
+    Expected columns: utm_source, utm_campaign, http_referer
+    """
+    utm_source = df_sessions.get("utm_source", pd.Series([None] * len(df_sessions)))
+    utm_campaign = df_sessions.get("utm_campaign", pd.Series([None] * len(df_sessions)))
+    http_ref = df_sessions.get("http_referer", pd.Series([None] * len(df_sessions)))
+
+    direct = utm_source.isna() & http_ref.isna()
+    organic = utm_source.isna() & http_ref.notna()
+    source_only = utm_source.notna() & utm_campaign.isna()
+
+    channel = pd.Series(index=df_sessions.index, dtype="object")
+    channel.loc[direct] = "direct"
+    channel.loc[organic] = "organic_or_referral"
+    channel.loc[source_only] = utm_source.loc[source_only].astype(str)
+    channel.loc[~(direct | organic | source_only)] = (
+        utm_source.loc[~(direct | organic | source_only)].astype(str)
+        + " / "
+        + utm_campaign.loc[~(direct | organic | source_only)].astype(str)
+    )
+    return channel
+
+
+def require_cols(df: pd.DataFrame, cols: list[str], df_name: str) -> None:
+    missing = [c for c in cols if c not in df.columns]
+    if missing:
+        raise ValueError(f"{df_name} is missing required columns: {missing}")
+
+
+# -----------------------------
+# Load
+# -----------------------------
+def load_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    sessions_path = RAW_DIR / "website_sessions.csv"
+    orders_path = RAW_DIR / "orders.csv"
+    refunds_path = RAW_DIR / "order_item_refunds.csv"
+
+    if not sessions_path.exists():
+        raise FileNotFoundError(f"Missing file: {sessions_path}")
+    if not orders_path.exists():
+        raise FileNotFoundError(f"Missing file: {orders_path}")
+    if not refunds_path.exists():
+        raise FileNotFoundError(f"Missing file: {refunds_path}")
+
+    sessions = pd.read_csv(sessions_path)
+    orders = pd.read_csv(orders_path)
+    refunds = pd.read_csv(refunds_path)
+
+    # Validate minimum required columns
+    require_cols(
+        sessions,
+        ["website_session_id", "created_at", "device_type"],
+        "website_sessions.csv",
+    )
+    require_cols(
+        orders,
+        ["order_id", "website_session_id", "created_at", "price_usd", "cogs_usd"],
+        "orders.csv",
+    )
+    # refunds schema can vary; we require refund_amount_usd and order_id to attribute
+    require_cols(refunds, ["refund_amount_usd"], "order_item_refunds.csv")
+    if "order_id" not in refunds.columns:
+        # Still run, but refunds will be treated as 0 (document this in your README)
+        print("⚠️ WARNING: order_item_refunds.csv has no 'order_id' column. Refunds will be treated as 0.")
+
+    # Parse datetimes
+    sessions["session_created_at"] = _to_datetime(sessions, "created_at")
+    orders["order_created_at"] = _to_datetime(orders, "created_at")
+    if "created_at" in refunds.columns:
+        refunds["refund_created_at"] = _to_datetime(refunds, "created_at")
+
+    # Derive channel + month dimension (month based on session time for attribution)
+    sessions["channel"] = derive_channel(sessions)
+    sessions["month"] = sessions["session_created_at"].dt.to_period("M").dt.to_timestamp()
+
+    return sessions, orders, refunds
+
+
+# -----------------------------
+# Core analysis
+# -----------------------------
+def compute_channel_roi_monthly(
+    sessions: pd.DataFrame, orders: pd.DataFrame, refunds: pd.DataFrame
+) -> pd.DataFrame:
+    """
+    Monthly ROI metrics by channel + device_type.
+
+    Profit (after refunds) = Revenue - COGS - Refunds
+    """
+    # 1) Roll up refunds to order-level (refunds are often item-level)
+    if "order_id" in refunds.columns:
+        refunds_by_order = (
+            refunds.groupby("order_id", as_index=False)["refund_amount_usd"]
+            .sum()
+            .rename(columns={"refund_amount_usd": "refunds_usd"})
+        )
+    else:
+        refunds_by_order = pd.DataFrame({"order_id": [], "refunds_usd": []})
+
+    # 2) Join refunds to orders
+    orders_enriched = orders.copy()
+    if not refunds_by_order.empty:
+        orders_enriched = orders_enriched.merge(refunds_by_order, on="order_id", how="left")
+    orders_enriched["refunds_usd"] = orders_enriched.get("refunds_usd", 0.0).fillna(0.0)
+
+    # 3) Attribute orders to sessions (LEFT join so sessions with 0 orders are kept)
+    base_sessions = sessions[["website_session_id", "channel", "device_type", "month"]].drop_duplicates()
+
+    joined = base_sessions.merge(
+        orders_enriched[["order_id", "website_session_id", "price_usd", "cogs_usd", "refunds_usd"]],
+        on="website_session_id",
+        how="left",
+    )
+
+    # 4) Aggregate metrics
+    monthly = joined.groupby(["channel", "device_type", "month"], as_index=False).agg(
+        sessions=("website_session_id", "nunique"),
+        orders=("order_id", lambda x: x.notna().sum()),
+        revenue_usd=("price_usd", "sum"),
+        cogs_usd=("cogs_usd", "sum"),
+        refunds_usd=("refunds_usd", "sum"),
+    )
+
+    # Clean NAs for channels with no orders
+    for col in ["revenue_usd", "cogs_usd", "refunds_usd"]:
+        monthly[col] = monthly[col].fillna(0.0)
+
+    # 5) Derived KPIs
+    monthly["cvr"] = monthly["orders"] / monthly["sessions"]
+    monthly["net_revenue_usd"] = monthly["revenue_usd"] - monthly["refunds_usd"]
+    monthly["gross_profit_usd"] = monthly["revenue_usd"] - monthly["cogs_usd"] - monthly["refunds_usd"]
+    monthly["aov_usd"] = monthly["revenue_usd"] / monthly["orders"].replace({0: pd.NA})
+    monthly["profit_per_session_usd"] = monthly["gross_profit_usd"] / monthly["sessions"].replace({0: pd.NA})
+
+    return monthly.sort_values(["month", "gross_profit_usd"], ascending=[True, False])
+
+
+def compute_channel_roi_summary(monthly: pd.DataFrame) -> pd.DataFrame:
+    """Summarize across the full time range by channel + device_type."""
+    summary = (
+        monthly.groupby(["channel", "device_type"], as_index=False)
+        .agg(
+            sessions=("sessions", "sum"),
+            orders=("orders", "sum"),
+            revenue_usd=("revenue_usd", "sum"),
+            cogs_usd=("cogs_usd", "sum"),
+            refunds_usd=("refunds_usd", "sum"),
+            net_revenue_usd=("net_revenue_usd", "sum"),
+            gross_profit_usd=("gross_profit_usd", "sum"),
+        )
+    )
+    summary["cvr"] = summary["orders"] / summary["sessions"]
+    summary["aov_usd"] = summary["revenue_usd"] / summary["orders"].replace({0: pd.NA})
+    summary["profit_per_session_usd"] = summary["gross_profit_usd"] / summary["sessions"].replace({0: pd.NA})
+    return summary.sort_values("gross_profit_usd", ascending=False)
+
+
+# -----------------------------
+# Charts + exports
+# -----------------------------
+def plot_top_channels(summary: pd.DataFrame) -> None:
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Profit by channel (aggregate device types)
+    profit = (
+        summary.groupby("channel", as_index=False)["gross_profit_usd"].sum()
+        .sort_values("gross_profit_usd", ascending=False)
+        .head(15)
+    )
+
+    plt.figure(figsize=(12, 6))
+    plt.bar(profit["channel"], profit["gross_profit_usd"])
+    plt.title("Top Channels by Gross Profit (after refunds)")
+    plt.xlabel("Channel")
+    plt.ylabel("Gross Profit (USD)")
+    plt.xticks(rotation=45, ha="right")
+    plt.tight_layout()
+    plt.savefig(OUT_DIR / "top_channels_by_profit.png", dpi=200)
+    plt.close()
+
+    # Profit per session by channel
+    pps = (
+        summary.groupby("channel", as_index=False)["profit_per_session_usd"].mean()
+        .sort_values("profit_per_session_usd", ascending=False)
+        .head(15)
+    )
+
+    plt.figure(figsize=(12, 6))
+    plt.bar(pps["channel"], pps["profit_per_session_usd"])
+    plt.title("Top Channels by Profit per Session")
+    plt.xlabel("Channel")
+    plt.ylabel("Profit per Session (USD)")
+    plt.xticks(rotation=45, ha="right")
+    plt.tight_layout()
+    plt.savefig(OUT_DIR / "top_channels_profit_per_session.png", dpi=200)
+    plt.close()
+
+
+def export_outputs(monthly: pd.DataFrame, summary: pd.DataFrame) -> None:
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    monthly.to_csv(OUT_DIR / "channel_roi_monthly.csv", index=False)
+    summary.to_csv(OUT_DIR / "channel_roi_summary.csv", index=False)
+
+
+# -----------------------------
+# Main
+# -----------------------------
+def main() -> None:
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    sessions, orders, refunds = load_data()
+
+    monthly = compute_channel_roi_monthly(sessions, orders, refunds)
+    summary = compute_channel_roi_summary(monthly)
+
+    export_outputs(monthly, summary)
+    plot_top_channels(summary)
+
+    print("✅ Done! Outputs written to:")
+    print(" - outputs/channel_roi_monthly.csv")
+    print(" - outputs/channel_roi_summary.csv")
+    print(" - outputs/top_channels_by_profit.png")
+    print(" - outputs/top_channels_profit_per_session.png")
+
+
+if __name__ == "__main__":
+    main()
