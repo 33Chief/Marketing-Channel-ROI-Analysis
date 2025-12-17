@@ -37,4 +37,4 @@ Conversion Rate (CVR)
 
 Revenue
 
-Cost of Goods Sold (
+Cost of Goods Sold 
