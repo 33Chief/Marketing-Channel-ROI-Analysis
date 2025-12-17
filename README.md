@@ -1,7 +1,7 @@
 # Marketing-Channel-ROI-Analysis
 Connecting Marketing Acquisition to Real Profitability
 
-This project analyzes how different marketing channels perform across the full e-commerce funnel — from website sessions to orders, refunds, and profit — using Python-only analytics.
+This project analyzes how different marketing channels perform across the full e-commerce funnel from website sessions to orders, refunds, and profit using Python-only analytics.
 
 🔍 Overview
 
